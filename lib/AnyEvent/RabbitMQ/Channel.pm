@@ -6,7 +6,7 @@ use warnings;
 use Scalar::Util qw(weaken);
 use AnyEvent::RabbitMQ::LocalQueue;
 
-our $VERSION = '1.03';
+our $VERSION = '1.04';
 
 sub new {
     my $class = shift;
@@ -624,6 +624,7 @@ sub _push_read_header_and_body {
     my $self = shift;
     my ($type, $frame, $cb, $failure_cb,) = @_;
     my $response = {$type => $frame};
+    my $body_size = 0;
 
     $self->{_content_queue}->get(sub{
         my $frame = shift;
@@ -638,17 +639,30 @@ sub _push_read_header_and_body {
         ) if !$header_frame->isa('Net::AMQP::Protocol::Basic::ContentHeader');
 
         $response->{header} = $header_frame;
+        $body_size = $frame->body_size;
     });
 
-    $self->{_content_queue}->get(sub{
+    my $body_payload = "";
+    my $next_frame; $next_frame = sub {
         my $frame = shift;
 
         return $failure_cb->('Received data is not body frame')
             if !$frame->isa('Net::AMQP::Frame::Body');
 
-        $response->{body} = $frame;
-        $cb->($response);
-    });
+        $body_payload .= $frame->payload;
+
+        if (length($body_payload) < $body_size) {
+            # More to come
+            $self->{_content_queue}->get($next_frame);
+        }
+        else {
+            $frame->payload($body_payload);
+            $response->{body} = $frame;
+            $cb->($response);
+        }
+    };
+
+    $self->{_content_queue}->get($next_frame);
 
     return $self;
 }
@@ -759,6 +773,8 @@ The name of the exchange to bind
 
 The routing key to bind with
 
+=back
+
 =head2 unbind_queue
 
 =head2 purge_queue
@@ -828,6 +844,8 @@ consumed after the on_success callback has been called.
 
 Arguments:
 
+=over
+
 =item consumer_tag
 
 Identifies this consumer, needs to be the value supplied when the queue is initially
@@ -840,6 +858,8 @@ Callback called if the subscription was successfully cancelled.
 =item on_failure
 
 Callback called if the subscription could not be cancelled for any reason.
+
+=back
 
 =head2 get
 
