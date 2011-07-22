@@ -28,8 +28,8 @@ requires:
   File::ShareDir: 0
   List::MoreUtils: 0
   Net::AMQP: 0
-  Readonly: 0
+  Readonly: 1.03
   namespace::clean: 0
 resources:
   license: http://dev.perl.org/licenses/
-version: 1.04
+version: 1.05
