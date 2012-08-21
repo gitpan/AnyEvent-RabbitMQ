@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 use Data::Dumper;
-use Carp qw(confess);
+use Carp qw(confess croak);
 use List::MoreUtils qw(none);
 use Devel::GlobalDestruction;
 use namespace::clean;
@@ -20,7 +20,7 @@ use Net::AMQP::Common qw(:all);
 use AnyEvent::RabbitMQ::Channel;
 use AnyEvent::RabbitMQ::LocalQueue;
 
-our $VERSION = '1.05';
+our $VERSION = '1.06';
 
 Readonly my $DEFAULT_AMQP_SPEC
     => File::ShareDir::dist_dir("AnyEvent-RabbitMQ") . '/fixed_amqp0-8.xml';
@@ -54,12 +54,17 @@ sub login_user {
     return $self->{_login_user};
 }
 
+my $_loaded_spec;
 sub load_xml_spec {
     my $self = shift;
     my ($spec) = @_;
-    Net::AMQP::Protocol->load_xml_spec(
-        $spec || $DEFAULT_AMQP_SPEC
-    ); # die when fail in this line.
+    $spec ||= $DEFAULT_AMQP_SPEC;
+    if ($_loaded_spec && $_loaded_spec ne $spec) {
+        croak("Tried to load AMQP spec $spec, but have already loaded $_loaded_spec, not possible");
+    }
+    elsif (!$_loaded_spec) {
+        Net::AMQP::Protocol->load_xml_spec($_loaded_spec = $spec);
+    }
     return $self;
 }
 
@@ -580,6 +585,11 @@ AnyEvnet::RabbitMQ is known to work with RabbitMQ versions 2.5.1 and version 0-8
 
 Masahito Ikuta E<lt>cooldaemon@gmail.comE<gt>
 
+=head1 MAINTAINER
+
+Currently maintained by C<< <bobtfish@bobtfish.net> >> due to the original
+author being missing in action.
+
 =head1 COPYRIGHT
 
 Copyright (c) 2010, the above named author(s).
@@ -592,3 +602,4 @@ This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself.
 
 =cut
+
