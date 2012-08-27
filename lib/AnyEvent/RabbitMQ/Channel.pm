@@ -6,7 +6,7 @@ use warnings;
 use Scalar::Util qw(weaken);
 use AnyEvent::RabbitMQ::LocalQueue;
 
-our $VERSION = '1.07';
+our $VERSION = '1.08';
 
 sub new {
     my $class = shift;
@@ -598,6 +598,8 @@ sub push_queue_or_consume {
             );
             $self->{_is_open} = 0;
             $self->{_is_active} = 0;
+            $self->{_queue}->_flush($frame);
+            $self->{_content_queue}->_flush($frame);
             $self->{connection}->delete_channel($self->{id});
             $self->{on_close}->($frame);
             return $self;
@@ -654,7 +656,8 @@ sub _push_read_header_and_body {
     });
 
     my $body_payload = "";
-    my $next_frame; $next_frame = sub {
+    my $w_next_frame;
+    my $next_frame = sub {
         my $frame = shift;
 
         return $failure_cb->('Received data is not body frame')
@@ -664,15 +667,16 @@ sub _push_read_header_and_body {
 
         if (length($body_payload) < $body_size) {
             # More to come
-            $self->{_content_queue}->get($next_frame);
+            $self->{_content_queue}->get($w_next_frame);
         }
         else {
-            undef $next_frame;
             $frame->payload($body_payload);
             $response->{body} = $frame;
             $cb->($response);
         }
     };
+    $w_next_frame = $next_frame;
+    weaken($w_next_frame);
 
     $self->{_content_queue}->get($next_frame);
 
@@ -719,7 +723,7 @@ AnyEvent::RabbitMQ::Channel - Abstraction of an AMQP channel.
     my $ch = $rf->open_channel();
     $ch->declare_exchange(exchange => 'test_exchange');
 
-=head1 DESRIPTION
+=head1 DESCRIPTION
 
 =head1 METHODS
 
@@ -838,7 +842,7 @@ supply a value if you want to be able to later cancel the subscription.
 
 =item on_success
 
-Callback called if the subscription was successfull (before the first message is consumed).
+Callback called if the subscription was successful (before the first message is consumed).
 
 =item on_failure
 
@@ -883,7 +887,7 @@ Arguments:
 
 =item queue
 
-Mandatory. Name of the queue to try to recieve a message from.
+Mandatory. Name of the queue to try to receive a message from.
 
 =item on_success
 
@@ -892,7 +896,7 @@ a notification that there was nothing to collect from the queue.
 
 =item on_failure
 
-This callback will be called if an error is signaled on this channel.
+This callback will be called if an error is signalled on this channel.
 
 =back
 
