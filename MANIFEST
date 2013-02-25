@@ -10,6 +10,7 @@ inc/Module/Install/Share.pm
 inc/Module/Install/Win32.pm
 inc/Module/Install/WriteAll.pm
 lib/AnyEvent/RabbitMQ.pm
+lib/AnyEvent/RabbitMQ/.Channel.pm.swp
 lib/AnyEvent/RabbitMQ/Channel.pm
 lib/AnyEvent/RabbitMQ/LocalQueue.pm
 Makefile.PL
@@ -17,6 +18,8 @@ MANIFEST			This list of files
 META.yml
 README
 share/fixed_amqp0-8.xml
+share/fixed_amqp0-9-1.xml
+share/README
 t/00_compile.t
 t/01_localqueue.t
 xt/01_podspell.t

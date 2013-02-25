@@ -3,24 +3,55 @@ package AnyEvent::RabbitMQ::Channel;
 use strict;
 use warnings;
 
-use Scalar::Util qw(weaken);
 use AnyEvent::RabbitMQ::LocalQueue;
+use Scalar::Util qw(weaken);
+use Carp qw(croak);
+BEGIN { *Dumper = \&AnyEvent::RabbitMQ::Dumper }
 
-our $VERSION = '1.08';
+our $VERSION = '1.09';
 
 sub new {
     my $class = shift;
+
     my $self = bless {
-        @_, # id, connection, on_close
-        _is_open       => 0,
-        _is_active     => 0,
+        @_,    # id, connection, on_return, on_close, on_inactive, on_active
         _queue         => AnyEvent::RabbitMQ::LocalQueue->new,
         _content_queue => AnyEvent::RabbitMQ::LocalQueue->new,
-        _consumer_cbs  => {},
-        _return_cbs    => {},
     }, $class;
     weaken($self->{connection});
+    return $self->_reset;
+}
+
+sub _reset {
+    my $self = shift;
+
+    my %a = (
+        _is_open       => 0,
+        _is_active     => 0,
+        _is_confirm    => 0,
+        _publish_tag   => 0,
+        _publish_cbs   => {},  # values: [on_ack, on_nack, on_return]
+        _consumer_cbs  => {},
+        _consumer_cans => {},
+    );
+    @$self{keys %a} = values %a;
+
     return $self;
+}
+
+sub is_open {
+    my $self = shift;
+    return $self->{_is_open};
+}
+
+sub is_active {
+    my $self = shift;
+    return $self->{_is_active};
+}
+
+sub is_confirm {
+    my $self = shift;
+    return $self->{_is_confirm};
 }
 
 sub queue {
@@ -65,49 +96,62 @@ sub close {
     # open, but we've closed it - a more elegant fix would be to mark that
     # the channel is opening, and wait for it to open before closing it
     if (!$self->{_is_open}) {
-        $self->{connection}->delete_channel($self->{id});
+        $connection->delete_channel($self->{id});
         $args{on_success}->($self);
         return $self;
     }
 
-    return $self->_close(%args) if 0 == scalar keys %{$self->{_consumer_cbs}};
+    # spell it out, so the callbacks always can call ->method_frame
+    my $close_frame = Net::AMQP::Frame::Method->new(
+        method_frame => Net::AMQP::Protocol::Channel::Close->new,
+    );
 
-    for my $consumer_tag (keys %{$self->{_consumer_cbs}}) {
-        $self->cancel(
-            consumer_tag => $consumer_tag,
-            on_success   => sub {
-                $self->_close(%args);
-            },
-            on_failure   => sub {
-                $self->_close(%args);
-                $args{on_failure}->(@_);
-            }
-        );
-    }
+    $connection->_push_write(
+        $close_frame,
+        $self->{id},
+    );
+
+    weaken(my $wself = $self);
+
+    $connection->_push_read_and_valid(
+        'Channel::CloseOk',
+        sub {
+            my $me = $wself or return;
+            $me->_close($close_frame, 0);
+            $args{on_success}->();
+        },
+        sub {
+            my $me = $wself or return;
+            $me->_close($close_frame, 0);
+            $args{on_failure}->();
+        },
+        $self->{id},
+    );
 
     return $self;
 }
 
 sub _close {
     my $self = shift;
-    my %args = @_;
+    my ($frame, $forced) = @_;
 
-    $self->{connection}->_push_write_and_read(
-        'Channel::Close', {}, 'Channel::CloseOk',
-        sub {
-            $self->{_is_open} = 0;
-            $self->{_is_active} = 0;
-            $self->{connection}->delete_channel($self->{id});
-            $args{on_success}->();
-        },
-        sub {
-            $self->{_is_open} = 0;
-            $self->{_is_active} = 0;
-            $self->{connection}->delete_channel($self->{id});
-            $args{on_failure}->();
-        },
-        $self->{id},
-    );
+    my $connection = $self->{connection};
+    my $on_close = $self->{on_close};
+
+    $self->{_is_open} = 0;
+    if ($frame) {
+        $self->{_queue}->_flush($frame);
+        $self->{_content_queue}->_flush($frame);
+    }
+    $self->_reset;
+
+    $connection->delete_channel($self->{id}) if $connection;
+
+    if (defined $on_close) {
+        local $@;
+        $on_close->($frame);
+        warn "Error in channel on_close callback, ignored:\n  $@  " if $@;
+    }
 
     return $self;
 }
@@ -281,11 +325,37 @@ sub publish {
     my $self = shift;
     my %args = @_;
 
-    return $self if !$self->{_is_active};
+    # Docs should advise channel-level callback over this, but still, better to give user an out
+    unless ($self->{_is_active}) {
+        if (defined $args{on_inactive}) {
+            $args{on_inactive}->();
+            return $self;
+        }
+        croak "Can't publish on inactive channel (server flow control); provide on_inactive callback";
+    }
 
-    my $header_args = delete $args{header}    || {};
-    my $body        = delete $args{body}      || '';
-    my $return_cb   = delete $args{on_return} || sub {};
+    my $header_args = delete $args{header};
+    my $body        = delete $args{body};
+    my $ack_cb      = delete $args{on_ack};
+    my $nack_cb     = delete $args{on_nack};
+    my $return_cb   = delete $args{on_return};
+
+    defined($header_args) or $header_args = {};
+    defined($body) or $body = '';
+    defined($ack_cb) or defined($nack_cb) or defined($return_cb)
+       and !$self->{_is_confirm}
+       and croak "Can't set on_ack/on_nack/on_return callback when not in confirm mode";
+
+    my $tag;
+    if ($self->{_is_confirm}) {
+        # yeah, delivery tags in acks are sequential.  see Java client
+        $tag = ++$self->{_publish_tag};
+        if ($return_cb) {
+            $header_args = { %$header_args };
+            $header_args->{headers}{_ar_return} = $tag;  # just reuse the same value, why not
+        }
+        $self->{_publish_cbs}{$tag} = [$ack_cb, $nack_cb, $return_cb];
+    }
 
     $self->_publish(
         %args,
@@ -294,12 +364,6 @@ sub publish {
     )->_body(
         $body,
     );
-
-    return $self if !$args{mandatory} && !$args{immediate};
-
-    $self->{_return_cbs}->{
-        ($args{exchange} || '') . '_' . $args{routing_key}
-    } = $return_cb;
 
     return $self;
 }
@@ -323,11 +387,13 @@ sub _publish {
 }
 
 sub _header {
-    my ($self, $args, $body,) = @_;
+    my ($self, $args, $body) = @_;
+
+    my $weight = delete $args->{weight} || 0;
 
     $self->{connection}->_push_write(
         Net::AMQP::Frame::Header->new(
-            weight       => $args->{weight} || 0,
+            weight       => $weight,
             body_size    => length($body),
             header_frame => Net::AMQP::Protocol::Basic::ContentHeader->new(
                 content_type     => 'application/octet-stream',
@@ -413,19 +479,13 @@ sub cancel {
         return $self;
     }
 
-    $self->{connection}->_push_write_and_read(
-        'Basic::Cancel',
-        {
+    $self->{_consumer_cans}{$args{consumer_tag}} = $cb;
+
+    $self->{connection}->_push_write(
+        Net::AMQP::Protocol::Basic::Cancel->new(
             %args, # consumer_tag
             nowait => 0,
-        },
-        'Basic::CancelOk', 
-        sub {
-            my $frame = shift;
-            delete $self->{_consumer_cbs}->{$args{consumer_tag}};
-            $cb->($frame);
-        },
-        $failure_cb,
+        ),
         $self->{id},
     );
 
@@ -502,9 +562,37 @@ sub qos {
     return $self;
 }
 
+sub confirm {
+    my $self = shift;
+    my ($cb, $failure_cb, %args) = $self->_delete_cbs(@_);
+
+    return $self if !$self->_check_open($failure_cb);
+    return $self if !$self->_check_version(0, 9, $failure_cb);
+
+    weaken(my $wself = $self);
+
+    $self->{connection}->_push_write_and_read(
+        'Confirm::Select',
+        {
+            %args,
+            nowait       => 0, # FIXME
+        },
+        'Confirm::SelectOk',
+        sub {
+            my $me = $wself or return;
+            $me->{_is_confirm} = 1;
+            $cb->();
+        },
+        $failure_cb,
+        $self->{id},
+    );
+
+    return $self;
+}
+
 sub recover {
     my $self = shift;
-    my %args = @_;
+    my ($cb, $failure_cb, %args) = $self->_delete_cbs(@_);
 
     return $self if !$self->_check_open(sub {});
 
@@ -515,6 +603,18 @@ sub recover {
         ),
         $self->{id},
     );
+
+     if (!$args{nowait} && $self->_check_version(0, 9)) {
+        $self->{connection}->_push_read_and_valid(
+            'Basic::RecoverOk',
+            $cb,
+            $failure_cb,
+            $self->{id},
+        );
+    }
+    else {
+        $cb->();
+    }
 
     return $self;
 }
@@ -596,12 +696,7 @@ sub push_queue_or_consume {
                 Net::AMQP::Protocol::Channel::CloseOk->new(),
                 $self->{id},
             );
-            $self->{_is_open} = 0;
-            $self->{_is_active} = 0;
-            $self->{_queue}->_flush($frame);
-            $self->{_content_queue}->_flush($frame);
-            $self->{connection}->delete_channel($self->{id});
-            $self->{on_close}->($frame);
+            $self->_close($frame, 0);
             return $self;
         } elsif ($method_frame->isa('Net::AMQP::Protocol::Basic::Deliver')) {
             my $cb = $self->{_consumer_cbs}->{
@@ -609,11 +704,59 @@ sub push_queue_or_consume {
             } || sub {};
             $self->_push_read_header_and_body('deliver', $frame, $cb, $failure_cb);
             return $self;
+        } elsif ($method_frame->isa('Net::AMQP::Protocol::Basic::CancelOk')) {
+            my $can_cb = delete $self->{_consumer_cans}{$method_frame->consumer_tag};
+            if ($can_cb) {
+                $can_cb->($method_frame);
+            }
+            else {
+                $failure_cb->("Received CancelOk for unknown consumer tag " . $method_frame->consumer_tag);
+            }
+            return $self;
         } elsif ($method_frame->isa('Net::AMQP::Protocol::Basic::Return')) {
-            my $cb = $self->{_return_cbs}->{
-                $method_frame->exchange . '_' . $method_frame->routing_key
-            } || sub {};
+            weaken(my $wself = $self);
+            my $cb = sub {
+                my $ret = shift;
+                my $me = $wself or return;
+                my $headers = $ret->{header}->headers || {};
+                my $onret_cb;
+                if (defined(my $tag = $headers->{_ar_return})) {
+                    my $cbs = delete $me->{_publish_cbs}{$tag};
+                    $onret_cb = $cbs->[2] if $cbs;
+                }
+                $onret_cb ||= $me->{on_return} || $me->{connection}{on_return} || sub {};  # oh well
+                $onret_cb->($frame);
+            };
             $self->_push_read_header_and_body('return', $frame, $cb, $failure_cb);
+            return $self;
+        } elsif ($method_frame->isa('Net::AMQP::Protocol::Basic::Ack') ||
+                 $method_frame->isa('Net::AMQP::Protocol::Basic::Nack')) {
+            (my $resp = ref($method_frame)) =~ s/.*:://;
+            my $cbs;
+            if (!$self->{_is_confirm}) {
+                $failure_cb->("Received $resp when not in confirm mode");
+            }
+            else {
+                my @tags;
+                if ($method_frame->{multiple}) {
+                    @tags = sort { $a <=> $b }
+                              grep { $_ <= $method_frame->{delivery_tag} }
+                                keys %{$self->{_publish_cbs}};
+                }
+                else {
+                    @tags = ($method_frame->{delivery_tag});
+                }
+                my $cbi = ($resp eq 'Ack') ? 0 : 1;
+                for my $tag (@tags) {
+                    my $cbs;
+                    if (not $cbs = delete $self->{_publish_cbs}{$tag}) {
+                        $failure_cb->("Received $resp of unknown delivery tag $tag");
+                    }
+                    elsif ($cbs->[$cbi]) {
+                        $cbs->[$cbi]->();
+                    }
+                }
+            }
             return $self;
         } elsif ($method_frame->isa('Net::AMQP::Protocol::Channel::Flow')) {
             $self->{_is_active} = $method_frame->active;
@@ -623,6 +766,9 @@ sub push_queue_or_consume {
                 ),
                 $self->{id},
             );
+            my $cbname = $self->{_is_active} ? 'on_active' : 'on_inactive';
+            my $cb = $self->{$cbname} || $self->{connection}{$cbname} || sub {};
+            $cb->($frame);
             return $self;
         }
         $self->{_queue}->push($frame);
@@ -655,10 +801,13 @@ sub _push_read_header_and_body {
         $body_size = $frame->body_size;
     });
 
+    weaken(my $wcontq = $self->{_content_queue});
     my $body_payload = "";
     my $w_next_frame;
     my $next_frame = sub {
         my $frame = shift;
+
+        my $contq = $wcontq or return;
 
         return $failure_cb->('Received data is not body frame')
             if !$frame->isa('Net::AMQP::Frame::Body');
@@ -667,7 +816,7 @@ sub _push_read_header_and_body {
 
         if (length($body_payload) < $body_size) {
             # More to come
-            $self->{_content_queue}->get($w_next_frame);
+            $contq->get($w_next_frame);
         }
         else {
             $frame->payload($body_payload);
@@ -703,9 +852,22 @@ sub _check_open {
     return 0;
 }
 
+sub _check_version {
+    my $self = shift;
+    my ($major, $minor, $failure_cb) = @_;
+
+    my $amaj = $Net::AMQP::Protocol::VERSION_MAJOR;
+    my $amin = $Net::AMQP::Protocol::VERSION_MINOR;
+
+    return 1 if $amaj >= $major || $amaj == $major && $amin >= $minor;
+
+    $failure_cb->("Not supported in AMQP $amaj-$amin") if $failure_cb;
+    return 0;
+}
+
 sub DESTROY {
     my $self = shift;
-    $self->close() if defined $self;
+    $self->close() if $self->{_is_open};
     return;
 }
 
@@ -724,6 +886,23 @@ AnyEvent::RabbitMQ::Channel - Abstraction of an AMQP channel.
     $ch->declare_exchange(exchange => 'test_exchange');
 
 =head1 DESCRIPTION
+
+=head1 ARGUMENTS FOR C<open_channel>
+
+=over
+
+=item on_close
+
+Callback invoked when the channel closes.  Callback will be passed the
+incoming message that caused the close, if any.
+
+=item on_return
+
+Callback invoked when a mandatory or immediate message publish fails.
+Callback will be passed the incoming message, with accessors
+C<method_frame>, C<header_frame>, and C<body_frame>.
+
+=back
 
 =head1 METHODS
 
@@ -813,6 +992,10 @@ Arguments:
 
 The text body of the message to send.
 
+=item header
+
+Customer headers for the message (if any).
+
 =item exchange
 
 The name of the exchange to send the message to.
@@ -820,6 +1003,10 @@ The name of the exchange to send the message to.
 =item routing_key
 
 The routing key with which to publish the message.
+
+=item on_ack
+
+Callback (if any) for confirming acknowledgment when in confirm mode.
 
 =back
 
@@ -903,6 +1090,11 @@ This callback will be called if an error is signalled on this channel.
 =head2 ack
 
 =head2 qos
+
+=head2 confirm
+
+Put channel into confirm mode.  In confirm mode, publishes are confirmed by
+the server, so the on_ack callback of publish works.
 
 =head2 recover
 
