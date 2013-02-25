@@ -30,7 +30,7 @@ use Net::AMQP::Common qw(:all);
 use AnyEvent::RabbitMQ::Channel;
 use AnyEvent::RabbitMQ::LocalQueue;
 
-our $VERSION = '1.09';
+our $VERSION = '1.10';
 
 Readonly my $DEFAULT_AMQP_SPEC
     => File::ShareDir::dist_dir("AnyEvent-RabbitMQ") . '/fixed_amqp0-9-1.xml';
@@ -117,7 +117,7 @@ sub connect {
                 sprintf('Error connecting to AMQP Server %s:%s: %s', $args{host}, $args{port}, $!)
             );
 
-            $self->{_handle} = AnyEvent::Handle->new(
+            my %handle_args = (
                 fh       => $fh,
                 on_error => sub {
                     my ($handle, $fatal, $message) = @_;
@@ -136,6 +136,10 @@ sub connect {
                         if exists $self->{drain_condvar};
                 },
             );
+            if ($args{tls}) {
+                $handle_args{tls} = 'connect';
+            }
+            $self->{_handle} = AnyEvent::Handle->new(%handle_args);
             $self->_read_loop($args{on_close}, $args{on_read_failure});
             $self->_start(%args,);
         },
@@ -574,6 +578,7 @@ AnyEvent::RabbitMQ - An asynchronous and multi channel Perl AMQP client.
       pass       => 'guest',
       vhost      => '/',
       timeout    => 1,
+      tls        => 0, # Or 1 if you'd like SSL
       on_success => sub {
           $ar->open_channel(
               on_success => sub {
@@ -620,6 +625,8 @@ You can use AnyEvent::RabbitMQ to -
   * Select, commit and rollback transactions
 
 AnyEvent::RabbitMQ is known to work with RabbitMQ versions 2.5.1 and versions 0-8 and 0-9-1 of the AMQP specification.
+
+This client is the non-blocking version, for a blocking version with a similar API, see L<Net::RabbitFoot>.
 
 =head1 AUTHOR
 

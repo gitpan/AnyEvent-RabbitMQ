@@ -1,5 +1,10 @@
 Revision history for Perl extension AnyEvent::RabbitMQ
 
+1.10  Mon Feb 25 13:48:00 2013
+        - Clarify relationship to Net::RabbitFoot. RT#71099
+
+        - Add TLS connection support. RT#81729
+
 1.09   Mon Feb 25 12:03:00 2013
         - Support AMQP heartbeat.
 
