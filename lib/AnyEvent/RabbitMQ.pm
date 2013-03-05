@@ -30,7 +30,7 @@ use Net::AMQP::Common qw(:all);
 use AnyEvent::RabbitMQ::Channel;
 use AnyEvent::RabbitMQ::LocalQueue;
 
-our $VERSION = '1.10';
+our $VERSION = '1.11';
 
 Readonly my $DEFAULT_AMQP_SPEC
     => File::ShareDir::dist_dir("AnyEvent-RabbitMQ") . '/fixed_amqp0-9-1.xml';
@@ -350,6 +350,11 @@ sub close {
             }
         );
     };
+
+    if (scalar(keys %{ $self->{_channels} })==0) {
+        $args{on_success}->(@_);
+    }
+
     for my $id (keys %{$self->{_channels}}) {
          my $channel = $self->{_channels}->{$id}
             or next; # Could have already gone away on global destruction..
