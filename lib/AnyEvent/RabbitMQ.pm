@@ -30,7 +30,7 @@ use Net::AMQP::Common qw(:all);
 use AnyEvent::RabbitMQ::Channel;
 use AnyEvent::RabbitMQ::LocalQueue;
 
-our $VERSION = '1.11';
+our $VERSION = '1.12';
 
 Readonly my $DEFAULT_AMQP_SPEC
     => File::ShareDir::dist_dir("AnyEvent-RabbitMQ") . '/fixed_amqp0-9-1.xml';
@@ -186,14 +186,18 @@ sub _read_loop {
                      '-----------', "\n";
             }
 
+            # TODO - check that a packet has been received within two times the
+            # heartbeat period.
+
             my $id = $frame->channel;
             if (0 == $id) {
                 if ($frame->type_id == 8) {
-                    $self->_push_write(Net::AMQP::Frame::Heartbeat->new());
-                    return;
+                    # Heartbeat, no action needs taking.
                 }
-                return if !$self->_check_close_and_clean($frame, $close_cb,);
-                $self->{_queue}->push($frame);
+                else {
+                    return if !$self->_check_close_and_clean($frame, $close_cb,);
+                    $self->{_queue}->push($frame);
+                }
             } else {
                 my $channel = $self->{_channels}->{$id};
                 if (defined $channel) {
@@ -220,6 +224,7 @@ sub _check_close_and_clean {
     my $method_frame = $frame->method_frame;
     return 1 if !$method_frame->isa('Net::AMQP::Protocol::Connection::Close');
 
+    delete $self->{_heartbeat};
     $self->_push_write(Net::AMQP::Protocol::Connection::CloseOk->new());
     $self->{_channels} = {};
     $self->{_is_open} = 0;
@@ -287,15 +292,26 @@ sub _tune {
         sub {
             my $frame = shift;
 
+            my %tune = map { my $t = $args{tune}{$_};
+                             ( $_ => defined($t) ? $t : $frame->method_frame->$_ ) }
+                          qw( channel_max frame_max heartbeat );
+
             $self->_push_write(
-                Net::AMQP::Protocol::Connection::TuneOk->new(
-                    channel_max => $frame->method_frame->channel_max,
-                    frame_max   => $frame->method_frame->frame_max,
-                    heartbeat   => $frame->method_frame->heartbeat,
-                ),
+                Net::AMQP::Protocol::Connection::TuneOk->new(%tune)
             );
 
             $self->_open(%args,);
+
+            if ($tune{heartbeat} > 0) {
+                $self->{_heartbeat} = AnyEvent->timer(
+                    after    => $tune{heartbeat},
+                    interval => $tune{heartbeat},
+                    cb => sub {
+                        $self->_push_write(Net::AMQP::Frame::Heartbeat->new());
+                    },
+                );
+            }
+
         },
         $args{on_failure},
     );
@@ -584,6 +600,7 @@ AnyEvent::RabbitMQ - An asynchronous and multi channel Perl AMQP client.
       vhost      => '/',
       timeout    => 1,
       tls        => 0, # Or 1 if you'd like SSL
+      tune       => { heartbeat => 30, channel_max => $whatever, frame_max = $whatever },
       on_success => sub {
           $ar->open_channel(
               on_success => sub {
