@@ -4,18 +4,27 @@ use strict;
 use warnings;
 
 use AnyEvent::RabbitMQ::LocalQueue;
+use AnyEvent;
 use Scalar::Util qw( looks_like_number weaken );
+use Devel::GlobalDestruction;
 use Carp qw(croak);
 BEGIN { *Dumper = \&AnyEvent::RabbitMQ::Dumper }
 
 use namespace::clean;
 
-our $VERSION = '1.13';
+use constant {
+    _ST_CLOSED => 0,
+    _ST_OPENING => 1,
+    _ST_OPEN => 2,
+};
+
+our $VERSION = '1.14';
 
 sub new {
     my $class = shift;
 
     my $self = bless {
+        on_close       => sub {},
         @_,    # id, connection, on_return, on_close, on_inactive, on_active
         _queue         => AnyEvent::RabbitMQ::LocalQueue->new,
         _content_queue => AnyEvent::RabbitMQ::LocalQueue->new,
@@ -28,7 +37,7 @@ sub _reset {
     my $self = shift;
 
     my %a = (
-        _is_open       => 0,
+        _state         => _ST_CLOSED,
         _is_active     => 0,
         _is_confirm    => 0,
         _publish_tag   => 0,
@@ -47,7 +56,7 @@ sub id {
 
 sub is_open {
     my $self = shift;
-    return $self->{_is_open};
+    return $self->{_state} == _ST_OPEN;
 }
 
 sub is_active {
@@ -69,20 +78,23 @@ sub open {
     my $self = shift;
     my %args = @_;
 
-    if ($self->{_is_open}) {
+    if ($self->{_state} != _ST_CLOSED) {
         $args{on_failure}->('Channel has already been opened');
         return $self;
     }
 
+    $self->{_state} = _ST_OPENING;
+
     $self->{connection}->_push_write_and_read(
         'Channel::Open', {}, 'Channel::OpenOk',
         sub {
-            $self->{_is_open}   = 1;
+            $self->{_state} = _ST_OPEN;
             $self->{_is_active} = 1;
-            $args{on_success}->();
+            $args{on_success}->($self);
         },
         sub {
-            $args{on_failure}->(@_);
+	    $self->{_state} = _ST_CLOSED;
+            $args{on_failure}->($self);
         },
         $self->{id},
     );
@@ -96,36 +108,45 @@ sub close {
         or return;
     my %args = $connection->_set_cbs(@_);
 
-    # Ensure to remove this channel from the connection even if we're not
-    # fully open to ensure $rf->close works always.
-    # FIXME - We can end up racing here so the server thinks the channel is
-    # open, but we've closed it - a more elegant fix would be to mark that
-    # the channel is opening, and wait for it to open before closing it
-    if (!$self->{_is_open}) {
-        $connection->_delete_channel($self);
-        $args{on_success}->($self);
-        return $self;
-    }
+    # If open in in progess, wait for it; 1s arbitrary timing.
 
-    $connection->_push_write(
-        $self->_close_frame,
-        $self->{id},
-    );
+    weaken(my $wself = $self);
+    my $t; $t = AE::timer 0, 1, sub {
+	(my $self = $wself) or undef $t, return;
+	return if $self->{_state} == _ST_OPENING;
 
-    $connection->_push_read_and_valid(
-        'Channel::CloseOk',
-        sub {
-            # circular ref ok
-            $self->_closed();
-            $args{on_success}->();
-        },
-        sub {
-            # circular ref ok
-            $self->_closed();
-            $args{on_failure}->();
-        },
-        $self->{id},
-    );
+	# No more tests are required
+	undef $t;
+
+        # Double close is OK
+	if ($self->{_state} == _ST_CLOSED) {
+	    $args{on_success}->($self);
+            return;
+        }
+
+        $connection->_push_write(
+            $self->_close_frame,
+            $self->{id},
+        );
+
+        # The spec says that after a party sends Channel::Close, it MUST
+        # discard all frames for that channel.  So this channel is dead
+        # immediately.
+        $self->_closed();
+
+        $connection->_push_read_and_valid(
+            'Channel::CloseOk',
+            sub {
+                $args{on_success}->($self);
+                $self->_orphan();
+            },
+            sub {
+                $args{on_failure}->(@_);
+                $self->_orphan();
+            },
+            $self->{id},
+        );
+    };
 
     return $self;
 }
@@ -133,31 +154,29 @@ sub close {
 sub _closed {
     my $self = shift;
     my ($frame,) = @_;
-    $frame ||= $self->_close_frame;
+    $frame ||= $self->_close_frame();
 
-    $self->{_is_open} or return;
-    $self->{_is_open} = 0;
+    return if $self->{_state} == _ST_CLOSED;
+    $self->{_state} = _ST_CLOSED;
 
     # Perform callbacks for all outstanding commands
     $self->{_queue}->_flush($frame);
     $self->{_content_queue}->_flush($frame);
 
+    # Fake nacks of all outstanding publishes
+    $_->($frame) for grep { defined } map { $_->[1] } values %{ $self->{_publish_cbs} };
+
     # Report cancelation of all outstanding consumes
     my @tags = keys %{ $self->{_consumer_cbs} };
     $self->_canceled($_, $frame) for @tags;
 
-    # Reset state (redundant?)
+    # Report close to on_close callback
+    { local $@;
+      eval { $self->{on_close}->($frame) };
+      warn "Error in channel on_close callback, ignored:\n  $@  " if $@; }
+
+    # Reset state (partly redundant)
     $self->_reset;
-
-    if (my $connection = $self->{connection}) {
-        $connection->_delete_channel($self);
-    }
-
-    if (my $cb = $self->{on_close}) {
-        local $@;
-        eval { $cb->($frame) };
-        warn "Error in channel on_close callback, ignored:\n  $@  " if $@;
-    }
 
     return $self;
 }
@@ -171,6 +190,15 @@ sub _close_frame {
             reply_text => $text,
         ),
     );
+}
+
+sub _orphan {
+    my $self = shift;
+
+    if (my $connection = $self->{connection}) {
+        $connection->_delete_channel($self);
+    }
+    return $self;
 }
 
 sub declare_exchange {
@@ -731,6 +759,9 @@ sub push_queue_or_consume {
     my $self = shift;
     my ($frame, $failure_cb,) = @_;
 
+    # Note: the spec says that after a party sends Channel::Close, it MUST
+    # discard all frames for that channel other than Close and CloseOk.
+
     if ($frame->isa('Net::AMQP::Frame::Method')) {
         my $method_frame = $frame->method_frame;
         if ($method_frame->isa('Net::AMQP::Protocol::Channel::Close')) {
@@ -739,6 +770,13 @@ sub push_queue_or_consume {
                 $self->{id},
             );
             $self->_closed($frame);
+            $self->_orphan();
+            return $self;
+        } elsif ($self->{_state} != _ST_OPEN) {
+            if ($method_frame->isa('Net::AMQP::Protocol::Channel::OpenOk') ||
+                $method_frame->isa('Net::AMQP::Protocol::Channel::CloseOk')) {
+                $self->{_queue}->push($frame);
+            }
             return $self;
         } elsif ($method_frame->isa('Net::AMQP::Protocol::Basic::Deliver')) {
             my $cons_cbs = $self->{_consumer_cbs}->{$method_frame->consumer_tag};
@@ -762,7 +800,7 @@ sub push_queue_or_consume {
                 my $headers = $ret->{header}->headers || {};
                 my $onret_cb;
                 if (defined(my $tag = $headers->{_ar_return})) {
-                    my $cbs = delete $me->{_publish_cbs}->{$tag};
+                    my $cbs = $me->{_publish_cbs}->{$tag};
                     $onret_cb = $cbs->[2] if $cbs;
                 }
                 $onret_cb ||= $me->{on_return} || $me->{connection}->{on_return} || sub {};  # oh well
@@ -794,7 +832,7 @@ sub push_queue_or_consume {
                         $failure_cb->("Received $resp of unknown delivery tag $tag");
                     }
                     elsif ($cbs->[$cbi]) {
-                        $cbs->[$cbi]->();
+                        $cbs->[$cbi]->($frame);
                     }
                 }
             }
@@ -887,7 +925,7 @@ sub _check_open {
     my $self = shift;
     my ($failure_cb) = @_;
 
-    return 1 if $self->{_is_open};
+    return 1 if $self->is_open();
 
     $failure_cb->('Channel has already been closed');
     return 0;
@@ -908,7 +946,7 @@ sub _check_version {
 
 sub DESTROY {
     my $self = shift;
-    $self->close() if $self->{_is_open};
+    $self->close() if !in_global_destruction && $self->is_open();
     return;
 }
 
@@ -1079,6 +1117,58 @@ Callback called if the subscription was successful (before the first message is 
 =item on_failure
 
 Callback called if the subscription fails for any reason.
+
+=back
+
+=head2 publish
+
+Publish a message to an exchange.
+
+Arguments:
+
+=over
+
+=item header
+
+Hash of AMQP message header info, including the confusingly similar element "headers",
+which may contain arbitrary string key/value pairs.
+
+=item body
+
+Message body.
+
+=item mandatory
+
+Boolean; if true, then if the message doesn't land in a queue (e.g. the exchange has no
+bindings), it will be "returned."  (see "on_return")
+
+=item immediate
+
+Boolean; if true, then if the message cannot be delivered directly to a consumer, it
+will be "returned."  (see "on_return")
+
+=item on_ack
+
+Callback called with the frame that acknowledges receipt (if channel is in confirm mode),
+typically L<Net::AMQP::Protocol::Basic::Ack>.
+
+=item on_nack
+
+Callback called with the frame that declines receipt (if the channel is in confirm mode),
+typically L<Net::AMQP::Protocol::Basic::Nack> or L<Net::AMQP::Protocol::Channel::Close>.
+
+=item on_return
+
+In AMQP, a "returned" message is one that cannot be delivered in compliance with the
+C<immediate> or C<mandatory> flags.
+
+If in confirm mode, this callback will be called with the frame that reports message
+return, typically L<Net::AMQP::Protocol::Basic::Return>.  If confirm mode is off or
+this callback is not provided, then the channel or connection objects' on_return
+callbacks (if any), will be called instead.
+
+NOTE: If confirm mode is on, the on_ack or on_nack callback will be called whether or
+not on_return is called first.
 
 =back
 

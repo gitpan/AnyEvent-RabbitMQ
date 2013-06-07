@@ -1,5 +1,16 @@
 Revision history for Perl extension AnyEvent::RabbitMQ
 
+1.14  Fri Jun  7 08:54:00 BST 2013
+        - Fix paper-bag bug in heartbeat - always lost heartbeat even on
+          active connections
+        - on channel close, automatically call on_return callbacks for any
+          publishes that are waiting
+        - maintain more state around opening and closing to avoid hang/race
+          when server sends Close after client does (this is possible!)
+        - cope with AMQP quirk that in confirm mode, returned messages are
+	  *also* acked/nacked
+        - document $channel->publish
+
 1.13  Thu May  2 16:48:58 PDT 2013
         - Require Net::AMQP 0.06 to:
            + Get consume cancel notifications (e.g. queue deletion)
