@@ -32,7 +32,7 @@ use AnyEvent::RabbitMQ::LocalQueue;
 
 use namespace::clean;
 
-our $VERSION = '1.14';
+our $VERSION = '1.15';
 
 use constant {
     _ST_CLOSED => 0,
@@ -147,7 +147,7 @@ sub connect {
                     my $self = $weak_self or return;
 
                     if ($self->is_open) {
-                        $self->_force_close($close_cb, $message);
+                        $self->_server_closed($close_cb, $message);
                     }
                     else {
                         $failure_cb->(@_);
@@ -378,7 +378,7 @@ sub _start_heartbeat {
         elsif (++$idle_cycles > 1) {
             delete $self->{_heartbeat_timer};
             $failure_cb->("Heartbeat lost");
-            $self->_force_close($close_cb, "Heartbeat lost");
+            $self->_server_closed($close_cb, "Heartbeat lost");
             return;
         }
         $self->_push_write(Net::AMQP::Frame::Heartbeat->new());
