@@ -32,7 +32,7 @@ use AnyEvent::RabbitMQ::LocalQueue;
 
 use namespace::clean;
 
-our $VERSION = '1.15';
+our $VERSION = '1.16';
 
 use constant {
     _ST_CLOSED => 0,
@@ -421,7 +421,7 @@ sub close {
     my $self = shift;
     my %args = $self->_set_cbs(@_);
 
-    if (!$self->{_state} == _ST_CLOSED) {
+    if ($self->{_state} == _ST_CLOSED) {
         $args{on_success}->(@_);
         return $self;
     }
@@ -459,7 +459,7 @@ sub _finish_close {
     my $self = shift;
     my %args = @_;
 
-    if (my @ch = map { $_->id } grep { defined() && $_->is_open } keys %{$self->{_channels}}) {
+    if (my @ch = map { $_->id } grep { defined() && $_->is_open } values %{$self->{_channels}}) {
         $args{on_failure}->("BUG: closing with channel(s) open: @ch");
         return;
     }
@@ -665,6 +665,7 @@ AnyEvent::RabbitMQ - An asynchronous and multi channel Perl AMQP client.
       tls        => 0, # Or 1 if you'd like SSL
       tune       => { heartbeat => 30, channel_max => $whatever, frame_max = $whatever },
       on_success => sub {
+          my $ar = shift;
           $ar->open_channel(
               on_success => sub {
                   my $channel = shift;
@@ -680,7 +681,7 @@ AnyEvent::RabbitMQ - An asynchronous and multi channel Perl AMQP client.
               on_close   => sub {
                   my $method_frame = shift->method_frame;
                   die $method_frame->reply_code, $method_frame->reply_text;
-              }
+              },
           );
       },
       on_failure => $cv,
@@ -688,7 +689,7 @@ AnyEvent::RabbitMQ - An asynchronous and multi channel Perl AMQP client.
       on_return  => sub {
           my $frame = shift;
           die "Unable to deliver ", Dumper($frame);
-      }
+      },
       on_close   => sub {
           my $why = shift;
           if (ref($why)) {
