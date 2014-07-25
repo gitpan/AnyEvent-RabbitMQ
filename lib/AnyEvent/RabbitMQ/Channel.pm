@@ -8,6 +8,7 @@ use AnyEvent;
 use Scalar::Util qw( looks_like_number weaken );
 use Devel::GlobalDestruction;
 use Carp qw(croak);
+use POSIX qw(ceil);
 BEGIN { *Dumper = \&AnyEvent::RabbitMQ::Dumper }
 
 use namespace::clean;
@@ -476,10 +477,16 @@ sub _header {
 sub _body {
     my ($self, $body,) = @_;
 
-    $self->{connection}->_push_write(
-        Net::AMQP::Frame::Body->new(payload => $body),
-        $self->{id},
-    );
+    my $body_max = $self->{connection}->{_body_max} || length $body;
+
+    # chunk up body into segments measured by $frame_max
+    while (length $body) {
+        $self->{connection}->_push_write(
+            Net::AMQP::Frame::Body->new(
+                payload => substr($body, 0, $body_max, '')),
+            $self->{id}
+        );
+    }
 
     return $self;
 }
